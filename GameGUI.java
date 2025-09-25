@@ -1,17 +1,16 @@
 import java.awt.Color;
 import java.awt.Graphics;
 import java.awt.Graphics2D;
-import java.awt.Rectangle;
 import java.awt.Image;
 import java.awt.Point;
-
+import java.awt.Rectangle;
+import java.awt.event.KeyAdapter;
+import java.awt.event.KeyEvent;
+import java.io.File;
+import java.util.Random;
+import javax.imageio.ImageIO;
 import javax.swing.JComponent;
 import javax.swing.JFrame;
-
-import java.io.File;
-import javax.imageio.ImageIO;
-
-import java.util.Random;
 
 /**
  * A Game board on which to place and move players.
@@ -58,6 +57,19 @@ public class GameGUI extends JComponent
   private int endVal = 10;
   private int offGridVal = 5; // penalty only
   private int hitWallVal = 5;  // penalty only
+  private int trapRemovalCost = 5;
+  private int collisionLimit = 6;
+  private int stepPenalty = 1;
+  
+  // trap collision tracking
+  private int trapCollisions = 0;
+  private int trapRemovals = 0;
+  private int removalChancesUsed = 0; // counts YES detrap uses only (max 2)
+  private boolean finishLocationTop = false; // false = bottom-right, true = top-right
+  private boolean pendingTrapCollision = false;
+  private boolean onTrapAfterRemovals = false; // true when standing on trap after 2 removals used
+  private boolean stepPenaltyActive = false; // true after 2 removals used and next trap hit
+  
 
   // game frame
   private JFrame frame;
@@ -95,13 +107,86 @@ public class GameGUI extends JComponent
     frame.setSize(WIDTH, HEIGHT);
     frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
     frame.add(this);
-    frame.setVisible(true);
     frame.setResizable(false); 
+    // Use KeyListener to capture real keyboard input
+    installKeyListener();
+    this.setFocusable(true);
+    frame.setVisible(true);
+    this.requestFocusInWindow();
+    frame.requestFocus();
 
     // set default config
     totalWalls = 20;
     totalPrizes = 3;
-    totalTraps = 5;
+    totalTraps = 8;
+    
+    // randomize finish location (top-right or bottom-right)
+    Random rand = new Random();
+    finishLocationTop = rand.nextBoolean();
+  }
+
+  /** Use a KeyListener to enqueue commands directly from keyboard events */
+  private void installKeyListener()
+  {
+    KeyAdapter adapter = new KeyAdapter()
+    {
+      @Override
+      public void keyPressed(KeyEvent e)
+      {
+        int code = e.getKeyCode();
+        switch (code)
+        {
+          case KeyEvent.VK_W:
+          case KeyEvent.VK_UP:
+            EscapeRoom.enqueueCommand("u");
+            break;
+          case KeyEvent.VK_A:
+          case KeyEvent.VK_LEFT:
+            EscapeRoom.enqueueCommand("l");
+            break;
+          case KeyEvent.VK_D:
+          case KeyEvent.VK_RIGHT:
+            EscapeRoom.enqueueCommand("r");
+            break;
+          case KeyEvent.VK_S:
+          case KeyEvent.VK_DOWN:
+            EscapeRoom.enqueueCommand("d");
+            break;
+          case KeyEvent.VK_T:
+            EscapeRoom.enqueueCommand("t");
+            break;
+          case KeyEvent.VK_SPACE:
+            EscapeRoom.enqueueCommand("space");
+            break;
+          case KeyEvent.VK_H:
+            EscapeRoom.enqueueCommand("h");
+            break;
+          case KeyEvent.VK_Q:
+            EscapeRoom.enqueueCommand("q");
+            break;
+          case KeyEvent.VK_Y:
+            EscapeRoom.enqueueCommand("y");
+            break;
+          case KeyEvent.VK_N:
+            EscapeRoom.enqueueCommand("n");
+            break;
+          case KeyEvent.VK_P:
+            EscapeRoom.enqueueCommand("p");
+            break;
+          case KeyEvent.VK_C:
+            EscapeRoom.enqueueCommand("c");
+            break;
+          case KeyEvent.VK_R:
+            EscapeRoom.enqueueCommand("restart");
+            break;
+          default:
+            break;
+        }
+      }
+    };
+    // Attach to both the component and the frame to maximize chances of focus
+    this.addKeyListener(adapter);
+    frame.addKeyListener(adapter);
   }
 
  /**
@@ -122,18 +207,23 @@ public class GameGUI extends JComponent
 
   /**
    * Increment/decrement the player location by the amount designated.
-   * This method checks for bumping into walls and going off the grid,
-   * both of which result in a penalty.
+   * This method checks for bumping into walls, going off the grid, and trap collisions.
    * <P>
    * precondition: amount to move is not larger than the board, otherwise player may appear to disappear
    * postcondition: increases number of steps even if the player did not actually move (e.g. bumping into a wall)
    * <P>
    * @param incrx amount to move player in x direction
    * @param incry amount to move player in y direction
-   * @return penalty score for hitting a wall or potentially going off the grid, 0 otherwise
+   * @return penalty score for hitting a wall, going off grid, or trap collision, 0 otherwise
    */
   public int movePlayer(int incrx, int incry)
   {
+      int perStepStickyPenalty = 0;
+      // Apply continuous -1 per step while currently standing on a trap after removals
+      if (trapRemovals >= 2 && isOnTrap())
+      {
+        perStepStickyPenalty -= stepPenalty;
+      }
       int newX = x + incrx;
       int newY = y + incry;
       
@@ -144,7 +234,9 @@ public class GameGUI extends JComponent
       if ( (newX < 0 || newX > WIDTH-SPACE_SIZE) || (newY < 0 || newY > HEIGHT-SPACE_SIZE) )
       {
         System.out.println ("OFF THE GRID!");
-        return -offGridVal;
+        // apply trap step penalty if standing on a trap and removals are exhausted
+        if (trapRemovals >= 2 && isOnTrap()) return perStepStickyPenalty;
+        return perStepStickyPenalty; // otherwise no score penalty
       }
 
       // determine if a wall is in the way
@@ -161,33 +253,48 @@ public class GameGUI extends JComponent
         if ((incrx > 0) && (x <= startX) && (startX <= newX) && (y >= startY) && (y <= endY))
         {
           System.out.println("A WALL IS IN THE WAY");
-          return -hitWallVal;
+          // apply trap step penalty if standing on a trap and removals are exhausted
+          if (trapRemovals >= 2 && isOnTrap()) return perStepStickyPenalty;
+          return perStepStickyPenalty; // otherwise no score penalty for hitting a wall
         }
         // moving LEFT, check to the left
         else if ((incrx < 0) && (x >= startX) && (startX >= newX) && (y >= startY) && (y <= endY))
         {
           System.out.println("A WALL IS IN THE WAY");
-          return -hitWallVal;
+          if (trapRemovals >= 2 && isOnTrap()) return perStepStickyPenalty;
+          return perStepStickyPenalty;
         }
         // moving DOWN check below
         else if ((incry > 0) && (y <= startY && startY <= newY && x >= startX && x <= endX))
         {
           System.out.println("A WALL IS IN THE WAY");
-          return -hitWallVal;
+          if (trapRemovals >= 2 && isOnTrap()) return perStepStickyPenalty;
+          return perStepStickyPenalty;
         }
         // moving UP check above
         else if ((incry < 0) && (y >= startY) && (startY >= newY) && (x >= startX) && (x <= endX))
         {
           System.out.println("A WALL IS IN THE WAY");
-          return -hitWallVal;
+          if (trapRemovals >= 2 && isOnTrap()) return -stepPenalty;
+          return 0;
         }     
       }
 
       // all is well, move player
       x += incrx;
       y += incry;
+      
+      // Check for trap collision at new location
+      int trapPenalty = checkTrapCollision();
+
+      // After both removals are used and next trap is hit, apply -1 on every step
+      if (stepPenaltyActive)
+      {
+        trapPenalty -= stepPenalty;
+      }
+      
       repaint();   
-      return 0;   
+      return perStepStickyPenalty + trapPenalty;   
   }
 
   /**
@@ -202,8 +309,8 @@ public class GameGUI extends JComponent
    */
   public boolean isTrap(int newx, int newy)
   {
-    double px = playerLoc.getX() + newx;
-    double py = playerLoc.getY() + newy;
+    double px = x + newx;
+    double py = y + newy;
 
 
     for (Rectangle r: traps)
@@ -236,8 +343,8 @@ public class GameGUI extends JComponent
    */
   public int springTrap(int newx, int newy)
   {
-    double px = playerLoc.getX() + newx;
-    double py = playerLoc.getY() + newy;
+    double px = x + newx;
+    double py = y + newy;
 
     // check all traps, some of which may be already sprung
     for (Rectangle r: traps)
@@ -266,8 +373,8 @@ public class GameGUI extends JComponent
    */
   public int pickupPrize()
   {
-    double px = playerLoc.getX();
-    double py = playerLoc.getY();
+    double px = x;
+    double py = y;
 
     for (Rectangle p: prizes)
     {
@@ -282,7 +389,7 @@ public class GameGUI extends JComponent
       }
     }
     System.out.println("OOPS, NO PRIZE HERE");
-    return -prizeVal;  
+    return 0; // no penalty for trying to pick up when no prize is present  
   }
 
   /**
@@ -293,6 +400,138 @@ public class GameGUI extends JComponent
   public int getSteps()
   {
     return playerSteps;
+  }
+  
+  /**
+   * Check if player is currently on a trap and handle collision
+   * @return penalty score for trap collision, 0 if no collision
+   */
+  public int checkTrapCollision()
+  {
+    double px = x;
+    double py = y;
+    
+    for (Rectangle t: traps)
+    {
+      if (t.getWidth() > 0 && t.contains(px, py))
+      {
+        trapCollisions++;
+        System.out.println("TRAP COLLISION! (" + trapCollisions + "/" + collisionLimit + ")");
+        if (removalChancesUsed >= 2)
+        {
+          // After both removals are used, activate step penalty on next trap hit
+          stepPenaltyActive = true;
+          return -stepPenalty;
+        }
+        else
+        {
+          // still have removals left: prompt caller whether to detrap
+          pendingTrapCollision = true;
+          return 0;
+        }
+      }
+    }
+    return 0;
+  }
+
+  /**
+   * Whether the last move resulted in a trap collision that requires prompting.
+   */
+  public boolean hasPendingTrapCollision()
+  {
+    return pendingTrapCollision;
+  }
+
+  /**
+   * Clear the pending trap collision flag after it has been handled by the caller.
+   */
+  public void clearPendingTrapCollision()
+  {
+    pendingTrapCollision = false;
+  }
+  
+  /**
+   * Check if player is currently on a trap
+   * @return true if player is on a trap, false otherwise
+   */
+  public boolean isOnTrap()
+  {
+    double px = x;
+    double py = y;
+    
+    for (Rectangle t: traps)
+    {
+      if (t.getWidth() > 0 && t.contains(px, py))
+      {
+        return true;
+      }
+    }
+    return false;
+  }
+  
+  /**
+   * Remove trap at player's current location
+   * @return cost of removal (negative score), or penalty if no trap or limit exceeded
+   */
+  public int removeTrap()
+  {
+    if (trapRemovals >= 2)
+    {
+      System.out.println("TRAP REMOVAL LIMIT REACHED! Traps are now permanent.");
+      return -trapRemovalCost;
+    }
+    
+    double px = x;
+    double py = y;
+    
+    for (Rectangle t: traps)
+    {
+      if (t.getWidth() > 0 && t.contains(px, py))
+      {
+        t.setSize(0, 0); // remove trap
+        trapRemovals++;
+        removalChancesUsed++;
+        System.out.println("TRAP REMOVED! (" + trapRemovals + "/2 removals used)");
+        return -trapRemovalCost;
+      }
+    }
+    
+    System.out.println("NO TRAP HERE TO REMOVE!");
+    return -trapRemovalCost;
+  }
+  
+  /**
+   * Get trap collision count
+   * @return number of trap collisions
+   */
+  public int getTrapCollisions()
+  {
+    return trapCollisions;
+  }
+  
+  /**
+   * Get trap removal count
+   * @return number of trap removals used
+   */
+  public int getTrapRemovals()
+  {
+    return trapRemovals;
+  }
+
+  /**
+   * Return total number of traps configured on the board.
+   */
+  public int getTotalTraps()
+  {
+    return totalTraps;
+  }
+
+  /**
+   * Consume a removal chance without removing a trap (user declined).
+   */
+  public void consumeRemovalChance()
+  {
+    if (removalChancesUsed < 2) removalChancesUsed++;
   }
   
   /**
@@ -333,13 +572,12 @@ public class GameGUI extends JComponent
 
   /**
    * Reset the board to replay existing game. The method can be called at any time but results in a penalty if called
-   * before the player reaches the far right wall.
+   * before the player reaches the finish location.
    * <P>
-   * @return positive score for reaching the far right wall, penalty otherwise
+   * @return positive score for reaching the finish location, penalty otherwise
    */
   public int replay()
   {
-
     int win = playerAtEnd();
   
     // resize prizes and traps to "reactivate" them
@@ -348,12 +586,50 @@ public class GameGUI extends JComponent
     for (Rectangle t: traps)
       t.setSize(SPACE_SIZE/3, SPACE_SIZE/3);
 
-    // move player to start of board
+    // move player to start of board and reset counters
     x = START_LOC_X;
     y = START_LOC_Y;
     playerSteps = 0;
+    trapCollisions = 0;
+    trapRemovals = 0;
+    removalChancesUsed = 0;
+    onTrapAfterRemovals = false;
+    stepPenaltyActive = false;
+    
+    // randomize finish location for replay
+    Random rand = new Random();
+    finishLocationTop = rand.nextBoolean();
+    
     repaint();
     return win;
+  }
+
+  /**
+   * Create a completely new board layout (for restart when player spawns on trap)
+   * @return 0 (no score change for restart)
+   */
+  public int restart()
+  {
+    // create new board with different layout
+    createBoard();
+    
+    // move player to start of board and reset counters
+    x = START_LOC_X;
+    y = START_LOC_Y;
+    playerSteps = 0;
+    trapCollisions = 0;
+    trapRemovals = 0;
+    removalChancesUsed = 0;
+    onTrapAfterRemovals = false;
+    stepPenaltyActive = false;
+    stepPenaltyActive = false;
+    
+    // randomize finish location for restart
+    Random rand = new Random();
+    finishLocationTop = rand.nextBoolean();
+    
+    repaint();
+    return 0; // no score change for restart
   }
 
  /**
@@ -482,18 +758,36 @@ public class GameGUI extends JComponent
   }
 
   /**
-   * Checks if player as at the far right of the board 
-   * @return positive score for reaching the far right wall, penalty otherwise
+   * Checks if player is at the finish location (randomized top-right or bottom-right)
+   * @return positive score for reaching finish, penalty otherwise
    */
   private int playerAtEnd() 
   {
     int score;
-
-    double px = playerLoc.getX();
-    if (px > (WIDTH - 2*SPACE_SIZE))
+    double px = x;
+    double py = y;
+    
+    // Check if at far right
+    boolean atRight = px > (WIDTH - 2*SPACE_SIZE);
+    
+    // Check if at correct vertical position based on finish location
+    boolean atCorrectY;
+    if (finishLocationTop) {
+      atCorrectY = py < SPACE_SIZE; // top area
+    } else {
+      atCorrectY = py > (HEIGHT - 2*SPACE_SIZE); // bottom area
+    }
+    
+    if (atRight && atCorrectY)
     {
-      System.out.println("YOU MADE IT!");
-      score = endVal;
+      // Check collision limit
+      if (trapCollisions > collisionLimit) {
+        System.out.println("TOO MANY TRAP COLLISIONS! Pay 5 points to finish anyway.");
+        score = -5; // penalty for too many collisions
+      } else {
+        System.out.println("YOU MADE IT!");
+        score = endVal;
+      }
     }
     else
     {
@@ -501,6 +795,18 @@ public class GameGUI extends JComponent
       score = -endVal;
     }
     return score;
-  
+  }
+
+  /**
+   * Check if the player is currently at the randomized finish location.
+   * @return true if at finish, false otherwise
+   */
+  public boolean isAtFinish()
+  {
+    double px = x;
+    double py = y;
+    boolean atRight = px > (WIDTH - 2*SPACE_SIZE);
+    boolean atCorrectY = finishLocationTop ? (py < SPACE_SIZE) : (py > (HEIGHT - 2*SPACE_SIZE));
+    return atRight && atCorrectY;
   }
 }
