@@ -70,6 +70,7 @@ public class EscapeRoom
                 case "restart": 
                     delta = game.restart(); 
                     score = 0; // reset score to 0
+                    System.out.println("Your Score and steps have reset");
                     break;
                 case "score": case "status":
                     System.out.println("Score: " + score + ", Steps: " + game.getSteps() +
